@@ -96,7 +96,91 @@ if (file_exists($technologiesJsonPath)) {
     extractAllStringsFromJson($techArray, $allowedTechnologiesStrings);
 }
 
-// --- Lancement manuel Whatweb ---
+// --- AJOUT : Suppression des résultats Amass ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_amass_results']) && isset($client['id'])) {
+    $pdo = new PDO(
+        "pgsql:host={$config['db']['host']};port={$config['db']['port']};dbname={$config['db']['dbname']}",
+        $config['db']['user'],
+        $config['db']['pass']
+    );
+    // Suppression des résultats temporaires Amass
+    $stmt = $pdo->prepare("DELETE FROM amass_scan_tmp WHERE client_id = :client_id");
+    $stmt->execute(['client_id' => $client['id']]);
+    // Suppression dans les autres tables possibles
+    $tables = ['amass_results', 'amass_result', 'amass_details', 'amass_scan', 'discovered_subdomains', 'subdomains'];
+    foreach ($tables as $t) {
+        if ($t === 'amass_scan' || $t === 'amass_results') {
+            $sql = "DELETE FROM $t WHERE client_id = :client_id";
+        } else {
+            $sql = "DELETE FROM $t WHERE client_id = :client_id";
+        }
+        try {
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute(['client_id' => $client['id']]);
+        } catch (Exception $e) {
+            // ignore si la table ou colonne n'existe pas
+        }
+    }
+    // Suppression des fichiers log Amass restants
+    foreach (glob("/tmp/amass_scan_*.log") as $logfile) {
+        @unlink($logfile);
+    }
+    header("Location: ?route=client_details&id=" . $client['id']);
+    exit;
+}
+
+// --- Lancement du scan Amass EN ARRIERE PLAN + ENREGISTREMENT EN BASE + MAJ TEMPS REEL ---
+$amass_debug_output = null;
+$amass_logfile = null;
+$amass_scan_id = null;
+if (isset($client['id'])) {
+    $amass_scan_id = null;
+    $amass_logfile = null;
+    $pdo = new PDO(
+        "pgsql:host={$config['db']['host']};port={$config['db']['port']};dbname={$config['db']['dbname']}",
+        $config['db']['user'],
+        $config['db']['pass']
+    );
+
+    // Lancement du scan
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['launch_amass_now'])) {
+        $stmt = $pdo->prepare("SELECT value FROM assets WHERE client_id = :id AND asset_type = 'domain' LIMIT 1");
+        $stmt->execute(['id' => $client['id']]);
+        $row = $stmt->fetch();
+        if ($row) {
+            $domaine = trim($row['value']);
+            // 1. Insère une ligne temporaire en base
+            $insert = $pdo->prepare("INSERT INTO amass_scan_tmp (client_id, output, finished) VALUES (:client_id, '', false) RETURNING id");
+            $insert->execute(['client_id' => $client['id']]);
+            $amass_scan_id = $insert->fetchColumn();
+            $amass_logfile = "/tmp/amass_scan_{$amass_scan_id}.log";
+            // 2. Vide le log avant de lancer un nouveau scan
+            file_put_contents($amass_logfile, "Scan Amass en cours...\n");
+
+            // 3. Lancer amass en arrière-plan
+            $cmd_amass = "HOME=/tmp timeout 150s /opt/go/bin/amass enum -passive -dir /tmp/amass_tmp -d " . escapeshellarg($domaine) . " > " . escapeshellarg($amass_logfile) . " 2>&1 &";
+            shell_exec($cmd_amass);
+
+            // 4. Lancer la synchro en arrière-plan
+            $cmd_sync = "/usr/local/bin/amass_sync_to_db.sh $amass_scan_id " . escapeshellarg($amass_logfile) . " > /dev/null 2>&1 &";
+            shell_exec($cmd_sync);
+
+            // 5. Redirige pour éviter le relancement lors du refresh
+            header("Location: ?route=client_details&id=" . $client['id']);
+            exit;
+        } else {
+            $amass_debug_output = "Aucun domaine principal n'a été trouvé pour ce client.";
+        }
+    }
+    // Affiche le dernier scan temporaire pour ce client
+    $stmt = $pdo->prepare("SELECT output, finished FROM amass_scan_tmp WHERE client_id = :client_id ORDER BY start_time DESC LIMIT 1");
+    $stmt->execute(['client_id' => $client['id']]);
+    $row = $stmt->fetch();
+    $amass_debug_output = $row ? $row['output'] : '';
+    $amass_scan_finished = $row ? $row['finished'] : false;
+}
+
+// --- Lancement manuel Whatweb (inchangé) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['launch_whatweb_now']) && isset($client['id'])) {
     $pdo = new PDO(
         "pgsql:host={$config['db']['host']};port={$config['db']['port']};dbname={$config['db']['dbname']}",
@@ -213,11 +297,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_whatweb_today'
 }
 
 // --- Récupération des résultats Whatweb ---
-$pdo = new PDO(
-    "pgsql:host={$config['db']['host']};port={$config['db']['port']};dbname={$config['db']['dbname']}",
-    $config['db']['user'],
-    $config['db']['pass']
-);
 $stmt = $pdo->prepare("
     SELECT
         w.id AS whatweb_id,
@@ -276,7 +355,9 @@ if ($selectedDay) {
         .whatweb-info-btn { display: inline-block; background: #eee; border-radius: 50%; width: 1.2em; height: 1.2em; text-align: center; font-size: 1em; font-weight: bold; color: #333; cursor: pointer; margin-left: 0.4em; border: 1px solid #bbb; line-height: 1.1em; }
         .whatweb-raw-output { display: none; max-width: 900px; background: #fcfcfc; border: 1px solid #aaa; color: #222; font-size: 0.97em; font-family: monospace; white-space: pre-wrap; padding: 0.8em 1em; margin: 0.6em 0 1.3em 0; overflow-x: auto; }
         .whatweb-raw-output.active { display: block; }
-        .whatweb-scan-btn { margin-bottom: 1em; margin-top: 0.5em; }
+        .whatweb-scan-btn { margin-bottom: 0.5em; margin-top: 0.5em; }
+        .amass-scan-btn { margin-bottom: 1em; }
+        .amass-debug-output { background: #222; color: #b5ffb5; font-family: monospace; font-size: 0.98em; border: 1.5px solid #006600; border-radius: 6px; margin: 1em 0 2em 0; padding: 1em; max-width: 900px; overflow-x: auto; white-space: pre-wrap; }
     </style>
 </head>
 <body>
@@ -313,6 +394,34 @@ if ($selectedDay) {
     <form method="post" action="" class="whatweb-scan-btn">
         <button type="submit" name="launch_whatweb_now">Lancer un scan Whatweb maintenant</button>
     </form>
+
+    <!-- Bouton lancer un scan Amass maintenant -->
+    <form method="post" action="" class="amass-scan-btn">
+        <button type="submit" name="launch_amass_now">Lancer un scan Amass maintenant (DEBUG, 150s max)</button>
+    </form>
+    <!-- Rafraîchir la sortie brute Amass -->
+    <form method="get" action="" class="amass-scan-btn" style="display:inline;">
+        <input type="hidden" name="route" value="client_details">
+        <input type="hidden" name="id" value="<?= $client['id'] ?>">
+        <button type="submit">Rafraîchir la sortie brute Amass</button>
+    </form>
+    <!-- Bouton pour supprimer tous les résultats Amass -->
+    <form method="post" action="" onsubmit="return confirm('Supprimer tous les résultats Amass de ce client ?');" style="display:inline;">
+        <button type="submit" name="delete_amass_results" style="background:#d33;color:white;">Supprimer tous les résultats Amass</button>
+    </form>
+
+    <?php if ($amass_debug_output !== null): ?>
+        <div class="amass-debug-output">
+            <b>Sortie brute Amass :</b><br>
+            <?= nl2br(htmlspecialchars($amass_debug_output)) ?>
+            <?php if (!empty($amass_debug_output) && empty($amass_scan_finished)): ?>
+                <br><i>(Scan en cours ou incomplet...)</i>
+            <?php elseif ($amass_scan_finished): ?>
+                <br><i>(Scan terminé)</i>
+            <?php endif; ?>
+        </div>
+    <?php endif; ?>
+
     <!-- Bouton supprimer le résultat whatweb du jour -->
     <form method="post" action="" onsubmit="return confirm('Supprimer tous les résultats Whatweb du jour ?');" style="display:inline;">
         <button type="submit" name="delete_whatweb_today" style="background:#e33;color:white;">Supprimer le résultat Whatweb d’aujourd’hui</button>
